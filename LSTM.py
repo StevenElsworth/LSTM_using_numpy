@@ -46,6 +46,14 @@ def initialise_derivatives(num_cells, features):
     dP['bv'] = np.zeros((features, 1))
     return dP
 
+# FOR USE WITH ADAM OPTIMIZER
+def initialise_momentum(dP):
+    M1, M2 = {}, {}
+    for key in P:
+        M1[key] = np.zeros_like(P[key])
+        M2[key] = np.zeros_like(P[key])
+    return M1, M2
+
 def forward_pass_through_LSTM(x, state, P):
     h_prev, c_prev = state
     # forget gate
@@ -128,7 +136,7 @@ def backward_pass_through_LSTM(deriv, passing_state, x, state_prev, state, cache
     passing_state = dh_prev, dc_prev
     return passing_state, dP
 
-def forward_backward_pass(inputs, targets2, input_state, P):
+def forward_backward_pass(inputs, targets2, input_state, P, M1, M2, optimizer, learning_rate, t):
     x, y, cache_1, state = {}, {}, {}, {}
     state[-1] = (np.copy(input_state[0]), np.copy(input_state[1]))
     loss = 0
@@ -142,19 +150,19 @@ def forward_backward_pass(inputs, targets2, input_state, P):
         loss += -np.log(y[t][np.argmax(targets2[t]), 0])
 
     # Backward pass through time steps
-    passing_state = (np.zeros_like(state[0][0]), np.zeros_like(state[0][1]))
+    passing_state = (np.zeros_like(state[-1][0]), np.zeros_like(state[-1][1]))
     dP = initialise_derivatives(num_cells, features) # clear gradients
     for t in reversed(range(len(inputs))):
         dv, dP = backprop_through_dense(state[t][0], y[t], targets2[t], dP)
         passing_state, dP = backward_pass_through_LSTM(dv, passing_state, np.array(inputs[t]).reshape(-1,1), state[t-1], state[t], cache_1[t], P, dP)
 
-    P = update_parameters(P, dP)
-    return loss, state[len(inputs)-1], P
+    P, M1, M2, t = update_parameters(optimizer, P, dP, M1, M2, t, learning_rate = learning_rate)
+    return loss, state[len(inputs)-1], P, M1, M2, t
 
 def prediction(state, x, length, P, alphabet):
     x = np.array(x).reshape(-1,1)
     pred = ''
-    for t in range(20):
+    for t in range(length):
         state, _ = forward_pass_through_LSTM(x, state, P)
         p = forward_pass_through_dense(state[0], P)
         idx = np.random.choice(range(features), p=p.ravel())
@@ -163,45 +171,95 @@ def prediction(state, x, length, P, alphabet):
         pred += alphabet[idx]
     return pred
 
-def update_parameters(P, dP, learning_rate = 0.1):
-    for key in P:
-        dP[key] = np.clip(dP[key], -1, 1, out= dP[key])
-        P[key] -= learning_rate * dP[key]
-    return P
+def update_parameters(optimizer, P, dP, M1, M2, t,  learning_rate = 0.001, decay_rate_1 = 0.9, decay_rate_2 = 0.999):
+    if optimizer == 'adam':
+        for key in P:
+            t = t + 1
+            dP[key] = np.clip(dP[key], -5, 5, out= dP[key])
+            M1[key] = (decay_rate_1)*M1[key] + (1 - decay_rate_1)*dP[key]
+            M2[key] = (decay_rate_2)*M2[key] + (1 - decay_rate_2)*(dP[key]**2)
+            m1 = M1[key]/(1 - decay_rate_1**(t))
+            m2 = M2[key]/(1 - decay_rate_2**(t))
+
+            P[key] = P[key] - learning_rate*(m1/(np.sqrt(m2)+ 1e-8))
+    else:
+        for key in P:
+            dP[key] = np.clip(dP[key], -1, 1, out= dP[key])
+            P[key] -= learning_rate * dP[key]
+
+    return P, M1, M2, t
+
+
 
 ################################################################################
 
+
 data = 'stevenstevenstevenstevenstevenstevenstevenstevensteven'
+optimizer = 'adam'  # 'adam' or 'GD'
+num_cells = 100
+T_steps = 4
+num_iterations = 100
+
 
 # One hot encode
 alphabet = sorted(list(set(data)))
 features = len(alphabet)
 encoded_data = [[0 if char != letter else 1 for char in alphabet] for letter in data]
 
-num_cells = 100
-T_steps = 10
+state = (np.zeros((num_cells, 1)), np.zeros((num_cells, 1)))
 
 # Initialise parameters
 P = {}
 P = initialise_parameters(P, num_cells, features)
+M1, M2 = initialise_momentum(P)
 
 iteration, location = 0, 0
-while iteration < 20000:
-    # Set to reset states every pass through data
-    if location + T_steps >= len(data) or iteration == 0:
-        # reset states
+Loss = []
+reset = False
+
+if optimizer == 'adam':
+    learning_rate = 0.001
+    t = 0
+elif optimizer == 'GD':
+    learning_rate = 2
+    t = 0
+else:
+    print('Unrecognised optimizer, default set to adam')
+    optimizer == 'adam'
+
+while iteration < num_iterations:
+    if location + T_steps >= len(data):
+        reset = True
+        # last chunk of data
+        inputs = encoded_data[location: -1]
+        targets = encoded_data[location + 1:]
+    else:
+        # define inputs and outputs
+        inputs = encoded_data[location: location + T_steps]
+        targets = encoded_data[location + 1: location + T_steps + 1]
+
+
+    loss, state, P, M1, M2, t = forward_backward_pass(inputs, targets, state, P, M1, M2, optimizer, learning_rate, t)
+    Loss.append(loss)
+
+    # Print an example prediction every 500 iterations
+    if (iteration % 500 == 0) and (iteration != 0) and reset:
+        if optimizer == 'GD':
+            learning_rate /= 2
+        print(prediction(state, encoded_data[0], 40, P, alphabet))
+
+    if reset:
+        reset = False
         state = (np.zeros((num_cells, 1)), np.zeros((num_cells, 1)))
-        pointer = 0
+        location = 0
+        iteration += 1
+    else:
+        location += T_steps
 
-    # define inputs and outputs
-    inputs = encoded_data[location: location + T_steps]
-    targets = encoded_data[location + 1: location + T_steps + 1]
+# Pass through with no backprop (also passes through last element of training set, unlike during training)
+state = (np.zeros((num_cells, 1)), np.zeros((num_cells, 1)))
+for t in range(len(encoded_data)):
+    (state, _) = forward_pass_through_LSTM(np.array(encoded_data[t]).reshape(-1,1), state, P)
+    _ = forward_pass_through_dense(state[0], P)
 
-    loss, state, P = forward_backward_pass(inputs, targets, state, P)
-
-    # Print every 500 steps
-    if iteration % 500 == 0:
-        print(prediction(state, encoded_data[0], 20, P, alphabet))
-        print('iteration:', iteration, 'loss:', loss, '\n')
-    pointer += T_steps
-    iteration += 1
+print(prediction(state, encoded_data[0], 40, P, alphabet))
